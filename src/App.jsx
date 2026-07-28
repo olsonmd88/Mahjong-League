@@ -24,22 +24,22 @@ const ADMIN_NAME    = "Michelle";
 const TOTAL_WEEKS   = 12;
 const TOP_GAMES     = 20;
 const STORY_CHAR_LIMIT = 1000;
-const STORAGE_BUCKET   = "story-notes"; // Supabase Storage bucket — must be created manually, see note below
+const STORAGE_BUCKET   = "story-notes"; // Supabase Storage bucket — must be created manually
 const DEFAULT_PLAYERS = ["Abbey","Alexa","Alyssa","Anna","Dixie","Ellen","Erica","Michelle","Zoe"];
 const WEEK_DATES = [
   "2026-04-22","2026-05-06","2026-05-20","2026-06-03","2026-06-17","2026-07-01",
   "2026-07-15","2026-07-29","2026-08-12","2026-08-26","2026-09-09","2026-09-23",
 ];
 const CARD_2026 = {
-  "2026":            ["Line 1","Line 2","Line 3","Line 4","Line 5","Line 6"],
+  "2026":            ["Line 1","Line 2","Line 3","Line 4"],
   "2468":            ["Line 1","Line 2","Line 3","Line 4","Line 5","Line 6","Line 7","Line 8"],
-  "Any Like Numbers":["Line 1","Line 2","Line 3","Line 4","Line 5","Line 6"],
-  "Consecutive Run": ["Line 1","Line 2","Line 3","Line 4","Line 5","Line 6","Line 7"],
-  "13579":           ["Line 1","Line 2","Line 3","Line 4","Line 5","Line 6"],
+  "Any Like Numbers":["Line 1","Line 2","Line 3"],
+  "Consecutive Run": ["Line 1","Line 2","Line 3","Line 4","Line 5","Line 6","Line 7","Line 8"],
+  "13579":           ["Line 1","Line 2","Line 3","Line 4","Line 5","Line 6","Line 7","Line 8","Line 9"],
   "Winds & Dragons": ["Line 1","Line 2","Line 3","Line 4","Line 5","Line 6","Line 7","Line 8"],
   "369":             ["Line 1","Line 2","Line 3","Line 4","Line 5","Line 6"],
-  "Singles & Pairs": ["Line 1","Line 2","Line 3","Line 4","Line 5","Line 6","Line 7"],
-  "Quints":          ["Line 1","Line 2","Line 3","Line 4","Line 5"],
+  "Singles & Pairs": ["Line 1","Line 2","Line 3","Line 4","Line 5","Line 6"],
+  "Quints":          ["Line 1","Line 2","Line 3"],
 };
 const CHALLENGES = [
   {week:1,  desc:"First Mahjong of the night",                        tileWall:false},
@@ -214,8 +214,9 @@ async function sbSave(state) {
 }
 
 // Uploads an image file to Supabase Storage and returns its public URL, or null on failure.
-// Requires a PUBLIC bucket named STORAGE_BUCKET to exist already — see Admin > Supabase tab
-// for the one-time manual setup step (Claude cannot create Storage buckets remotely).
+// Requires a PUBLIC bucket named STORAGE_BUCKET to exist already, with an INSERT policy
+// allowing writes (see Admin > Supabase tab notes). No x-upsert — filenames are unique
+// via timestamp, and upsert would additionally require an UPDATE policy to satisfy Postgres RLS.
 async function sbUploadImage(file, weekNum, playerName) {
   if (!USE_SUPABASE || !file) return null;
   try {
@@ -228,7 +229,6 @@ async function sbUploadImage(file, weekNum, playerName) {
         "apikey": _key,
         "Authorization": `Bearer ${_key}`,
         "Content-Type": file.type || "image/jpeg",
-        "x-upsert": "true",
       },
       body: file,
     });
@@ -292,6 +292,8 @@ function computeStats(weeks, players, settings) {
     s[p].countingGames = sorted.slice(0, topN);
     s[p].droppedGames  = sorted.slice(topN);
     s[p].topScore      = s[p].countingGames.reduce((t,g) => t + g.points, 0);
+    s[p].totalPoints   = s[p].allGames.reduce((t,g) => t + g.points, 0);
+    s[p].ppg           = s[p].totalGames > 0 ? s[p].totalPoints / s[p].totalGames : 0;
     s[p].sectionsCount = s[p].sections.size;
   });
 
@@ -389,32 +391,47 @@ function assignTables(attending, stats, shuffleSeed, weeks) {
   const for3P = sorted.slice(0, num3P * 3);
   const for4P = sorted.slice(num3P * 3);
 
-  // ── step 4: within each pool, use a greedy pair-minimising assignment ─────
-  // Score a candidate table by total pair-plays among its members (lower = better)
+  // ── step 4: within each pool, heavily prioritise pair-frequency ───────────
+  // Pair-plays are SQUARED so repeat pairings (especially 2nd/3rd meetings)
+  // are penalised much more than a single prior meeting — this is the "fewest
+  // games played together" priority, weighted more strongly than before.
+  function pairPenalty(a, b) {
+    const c = getPairCount(a, b);
+    return c * c;
+  }
   function tablePairScore(members) {
     let score = 0;
     for (let i = 0; i < members.length; i++)
       for (let j = i + 1; j < members.length; j++)
-        score += getPairCount(members[i], members[j]);
+        score += pairPenalty(members[i], members[j]);
     return score;
   }
 
   // Greedy: pick the first player, then repeatedly pick the next player who
-  // minimises total pair-score with already-chosen members, with tie-breaking
-  // via the seeded shuffle so "Try another" yields genuinely different results.
-  function greedyAssign(pool, tableSize) {
+  // minimises total pair-penalty with already-chosen members.
+  function greedyAssignOnce(pool, tableSize, runSeed) {
+    let s = runSeed;
+    function localShuffle(arr) {
+      const a = [...arr];
+      for (let i = a.length - 1; i > 0; i--) {
+        s = (s * 1664525 + 1013904223) & 0xffffffff;
+        const j = Math.abs(s) % (i + 1);
+        [a[i], a[j]] = [a[j], a[i]];
+      }
+      return a;
+    }
     const tables = [];
-    let remaining = seededShuffle(pool); // shuffle first for variety
+    let remaining = localShuffle(pool); // shuffle first for variety
     while (remaining.length >= tableSize) {
       const table = [remaining[0]];
       remaining = remaining.slice(1);
       while (table.length < tableSize) {
-        // Score each candidate by how many times they've played with current table members
+        // Score each candidate by pair-penalty with current table members
         let bestIdx = 0;
         let bestScore = Infinity;
         for (let i = 0; i < remaining.length; i++) {
           let score = 0;
-          for (const m of table) score += getPairCount(m, remaining[i]);
+          for (const m of table) score += pairPenalty(m, remaining[i]);
           if (score < bestScore) { bestScore = score; bestIdx = i; }
         }
         table.push(remaining[bestIdx]);
@@ -427,8 +444,25 @@ function assignTables(attending, stats, shuffleSeed, weeks) {
     return tables;
   }
 
-  const tables3P = num3P > 0 ? greedyAssign(for3P, 3) : [];
-  const tables4P = num4P > 0 ? greedyAssign(for4P, 4) : [];
+  // Run several shuffled trials per pool and keep the arrangement with the
+  // LOWEST total pair-penalty — a single greedy pass can get stuck with a
+  // mediocre starting player, so this searches harder for the best grouping
+  // by fewest-games-played-together, while "Try another" still varies seeds.
+  const TRIALS = 20;
+  function bestAssign(pool, tableSize) {
+    if (!pool.length) return [];
+    let best = null, bestScore = Infinity;
+    for (let t = 0; t < TRIALS; t++) {
+      const trialSeed = (seed + t * 97 + tableSize * 131) & 0xffffffff;
+      const tables = greedyAssignOnce(pool, tableSize, trialSeed || 1);
+      const score = tables.reduce((tot, tab) => tot + tablePairScore(tab), 0);
+      if (score < bestScore) { bestScore = score; best = tables; }
+    }
+    return best;
+  }
+
+  const tables3P = num3P > 0 ? bestAssign(for3P, 3) : [];
+  const tables4P = num4P > 0 ? bestAssign(for4P, 4) : [];
 
   return [...tables4P, ...tables3P];
 }
@@ -648,7 +682,7 @@ function Dashboard({stats, weeks, settings, awards, players, payouts, setView, s
   const safeAwards  = awards  || [];
   const safePayouts = payouts || {first:400, second:150, third:75};
 
-  const sorted      = [...safePlayers].sort((a,b) => (stats[b]?.topScore||0) - (stats[a]?.topScore||0));
+  const sorted      = [...safePlayers].sort((a,b) => (stats[b]?.ppg||0) - (stats[a]?.ppg||0));
   const gamesLogged = safeWeeks.reduce((t,w) => t + (w.games?.length||0), 0);
   const nextWeek    = safeWeeks.find(w => !(w.games?.length)) || safeWeeks[safeWeeks.length-1] || {};
   const avg3P       = safePlayers.length > 0
@@ -661,13 +695,13 @@ function Dashboard({stats, weeks, settings, awards, players, payouts, setView, s
     <div className="fa">
       <div style={{marginBottom:20}}>
         <h1 style={{fontFamily:"Playfair Display,serif",fontSize:28,color:C.roseDark,fontStyle:"italic"}}>Welcome back 🌸</h1>
-        <p style={{color:C.textSoft,fontSize:13,marginTop:4}}>Top {settings?.topGames||TOP_GAMES} games count • {TOTAL_WEEKS}-week season</p>
+        <p style={{color:C.textSoft,fontSize:13,marginTop:4}}>Ranked by average points per game • {TOTAL_WEEKS}-week season</p>
       </div>
 
       {/* Metric tiles */}
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:12,marginBottom:20}}>
         {[
-          {icon:"🏆", label:"Season leader",  val:sorted[0]||"–",          sub:sorted[0] ? `${stats[sorted[0]]?.topScore||0} pts` : "No games yet"},
+          {icon:"🏆", label:"Season leader",  val:sorted[0]||"–",          sub:sorted[0] ? `${(stats[sorted[0]]?.ppg||0).toFixed(1)} pts/game` : "No games yet"},
           {icon:"🀄", label:"Games logged",   val:gamesLogged,              sub:"total this season"},
           {icon:"📅", label:"Next up",        val:`Week ${nextWeek.week||"?"}`, sub:fmt(nextWeek.date)||"Date TBD", extra:nextWeek.location||""},
           {icon:"🌸", label:"Weeks played",   val:safeWeeks.filter(w=>w.games?.length).length, sub:`of ${TOTAL_WEEKS}`},
@@ -693,8 +727,11 @@ function Dashboard({stats, weeks, settings, awards, players, payouts, setView, s
                 <span style={{fontSize:12,color:C.textSoft,minWidth:20,fontWeight:700}}>{i===0?"🥇":i===1?"🥈":i===2?"🥉":i+1}</span>
                 <Av name={p} players={safePlayers}/>
                 <span style={{flex:1,fontSize:13,fontWeight:600}}>{p}</span>
-                <span style={{fontSize:15,fontWeight:700,color:C.roseDark}}>{stats[p]?.topScore||0}</span>
-                <span style={{fontSize:11,color:C.textSoft,minWidth:28,textAlign:"right"}}>{stats[p]?.totalGames||0}g</span>
+                <div style={{textAlign:"right",lineHeight:1.1}}>
+                  <div style={{fontSize:15,fontWeight:700,color:C.roseDark}}>{(stats[p]?.ppg||0).toFixed(1)}</div>
+                  <div style={{fontSize:9,color:C.textSoft}}>pts/game</div>
+                </div>
+                <span style={{fontSize:11,color:C.textSoft,minWidth:62,textAlign:"right"}}>{stats[p]?.totalPoints||0} pts · {stats[p]?.totalGames||0}g</span>
               </div>
             ))
           }
@@ -780,7 +817,7 @@ function Dashboard({stats, weeks, settings, awards, players, payouts, setView, s
 
 // ─── STANDINGS ────────────────────────────────────────────────────────────────
 function Standings({stats, settings, players}) {
-  const [sortBy, setSort] = useState("topScore");
+  const [sortBy, setSort] = useState("ppg");
   const safe = players || [];
   const sorted = [...safe].sort((a,b) => {
     if (sortBy === "name") return a.localeCompare(b);
@@ -791,7 +828,8 @@ function Standings({stats, settings, players}) {
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:8}}>
         <h2 style={{fontFamily:"Playfair Display,serif",fontSize:22,color:C.roseDark,fontStyle:"italic"}}>Season standings</h2>
         <select value={sortBy} onChange={e=>setSort(e.target.value)} style={{width:"auto",fontSize:12}}>
-          <option value="topScore">By score</option>
+          <option value="ppg">By points/game</option>
+          <option value="totalPoints">By total score</option>
           <option value="totalGames">By games played</option>
           <option value="highestHandBonus">By highest hand</option>
           <option value="sectionsCount">By sections covered</option>
@@ -799,9 +837,10 @@ function Standings({stats, settings, players}) {
         </select>
       </div>
       <Card pad="0" style={{overflow:"hidden",marginBottom:20}}>
-        <div style={{display:"grid",gridTemplateColumns:"28px 1fr 65px 55px 50px 50px 65px",padding:"10px 16px",background:C.sakura,fontSize:11,color:C.textMid,fontWeight:700,gap:6}}>
+        <div style={{display:"grid",gridTemplateColumns:"24px 1fr 50px 50px 46px 44px 38px 44px",padding:"10px 16px",background:C.sakura,fontSize:11,color:C.textMid,fontWeight:700,gap:6}}>
           <span>#</span><span>Player</span>
-          <span style={{textAlign:"center"}}>Score</span>
+          <span style={{textAlign:"center"}}>PPG</span>
+          <span style={{textAlign:"center"}}>Total</span>
           <span style={{textAlign:"center"}}>Games</span>
           <span style={{textAlign:"center"}}>3P%</span>
           <span style={{textAlign:"center"}}>Sec.</span>
@@ -811,16 +850,17 @@ function Standings({stats, settings, players}) {
           const s = stats[p] || {};
           const pct3 = s.totalGames > 0 ? Math.round(s.threePersonGames/s.totalGames*100) : 0;
           return (
-            <div key={p} style={{display:"grid",gridTemplateColumns:"28px 1fr 65px 55px 50px 50px 65px",padding:"11px 16px",borderTop:`1px solid ${C.border}`,gap:6,alignItems:"center",background:i%2===0?"transparent":C.petal}}>
+            <div key={p} style={{display:"grid",gridTemplateColumns:"24px 1fr 50px 50px 46px 44px 38px 44px",padding:"11px 16px",borderTop:`1px solid ${C.border}`,gap:6,alignItems:"center",background:i%2===0?"transparent":C.petal}}>
               <span style={{fontSize:12,color:C.textSoft,fontWeight:700}}>{i===0?"🥇":i===1?"🥈":i===2?"🥉":i+1}</span>
               <div style={{display:"flex",alignItems:"center",gap:7}}>
                 <Av name={p} players={safe} size={24}/>
                 <div>
                   <div style={{fontSize:13,fontWeight:700}}>{p}</div>
-                  <div style={{fontSize:10,color:C.textSoft}}>{s.countingGames?.length||0} counting</div>
+                  <div style={{fontSize:10,color:C.textSoft}}>{s.totalGames||0} games played</div>
                 </div>
               </div>
-              <span style={{fontSize:15,fontWeight:700,textAlign:"center",color:i===0?"#B8860B":i===1?C.textSoft:i===2?"#CD7F32":C.roseDark}}>{s.topScore||0}</span>
+              <span style={{fontSize:15,fontWeight:700,textAlign:"center",color:i===0?"#B8860B":i===1?C.textSoft:i===2?"#CD7F32":C.roseDark}}>{(s.ppg||0).toFixed(1)}</span>
+              <span style={{fontSize:13,textAlign:"center",fontWeight:600}}>{s.totalPoints||0}</span>
               <span style={{fontSize:12,textAlign:"center",fontWeight:600}}>{s.totalGames||0}</span>
               <span style={{fontSize:12,textAlign:"center",fontWeight:600}}>{pct3}%</span>
               <span style={{fontSize:12,textAlign:"center",fontWeight:600}}>{s.sectionsCount||0}</span>
@@ -835,7 +875,6 @@ function Standings({stats, settings, players}) {
         {sorted.map(p => {
           const s = stats[p] || {};
           const all = [...(s.allGames||[])].sort((a,b) => b.points - a.points);
-          const topN = settings?.topGames || TOP_GAMES;
           return (
             <Card key={p} pad="1rem">
               <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
@@ -846,11 +885,15 @@ function Standings({stats, settings, players}) {
                 {all.length === 0
                   ? <span style={{fontSize:12,color:C.textSoft,fontStyle:"italic"}}>No games yet</span>
                   : all.map((g,i) => (
-                    <span key={i} className="pill" style={{background:i<topN?C.mint:C.sakura,color:i<topN?C.mintDark:C.textSoft,padding:"2px 7px"}}>{g.points}pt</span>
+                    <span key={i} className="pill" style={{background:C.mint,color:C.mintDark,padding:"2px 7px"}}>{g.points}pt</span>
                   ))
                 }
               </div>
-              {all.length > 0 && <div style={{fontSize:12,color:C.textMid}}>Season total: <strong style={{color:C.roseDark}}>{s.topScore||0}pts</strong></div>}
+              {all.length > 0 && (
+                <div style={{fontSize:12,color:C.textMid}}>
+                  <strong style={{color:C.roseDark}}>{(s.ppg||0).toFixed(1)}</strong> pts/game · {s.totalPoints||0} pts total · {s.totalGames||0} games
+                </div>
+              )}
             </Card>
           );
         })}
@@ -1256,12 +1299,6 @@ function PublishedRecap({week}) {
   );
 }
 
-
-// Shows every uploaded photo immediately, season-wide, regardless of whether that
-// week's recap has been published — matches "everyone has access to them" as asked.
-// If you'd rather gate a week's photos until that week's recap goes out (same
-// reveal treatment as the story text), add `&& w.recap?.status === "published"`
-// to the filter condition below.
 // ─── PHOTO GALLERY ────────────────────────────────────────────────────────────
 // Shows every uploaded photo immediately, season-wide, regardless of whether that
 // week's recap has been published — matches "everyone has access to them" as asked.
@@ -1632,7 +1669,7 @@ function Rules() {
   ];
   const faqs = [
     {q:"How do I earn points?", a:"You earn the point value on the card for the line you win with. If you won without any Jokers, you get an additional 10-point bonus. This bonus does not apply to Singles & Pairs hands."},
-    {q:"What counts as my season score?", a:`Your season score is the sum of your best ${TOP_GAMES} individual game results. If you've played fewer than ${TOP_GAMES} games, all of them count. Playing more gives you more chances to replace a bad game.`},
+    {q:"How is my season ranking determined?", a:"Standings are ranked by your average points per game (PPG) — your total points divided by how many games you've played. Every game counts toward your average. The Home and Standings tabs also show your total points and games played for reference."},
     {q:"How do weekly challenges work?", a:"Each week has a challenge worth $5. The first person to complete it wins. Multiple people can claim it and split the pot. If no one wins, the $5 rolls to the next week. Each week always starts fresh at $5 base."},
     {q:"What are the season prizes?", a:"Season-end prize amounts are set by the admin (check the Home tab for current amounts). Plus $10 side awards for: first concealed hand, most card sections covered, and highest single hand value."},
     {q:"Can I place side bets?", a:"Yes! Side bets are optional and separate from league scoring. If a non-betting player wins the game, the $5 is returned to each bettor."},
@@ -1891,7 +1928,7 @@ function Admin({st, upd, stats, players}) {
   const [removeTarget, setRemoveTarget] = useState(null);
   const [confirmRemove,setConfirmRemove] = useState(false);
   const safe   = players || [];
-  const sorted = [...safe].sort((a,b) => (stats[b]?.topScore||0)-(stats[a]?.topScore||0));
+  const sorted = [...safe].sort((a,b) => (stats[b]?.ppg||0)-(stats[a]?.ppg||0));
   const payouts = st.seasonPayouts || {first:400, second:150, third:75};
 
   function addPlayer() {
@@ -1998,7 +2035,7 @@ insert into league_state (id,data)
                   <Av name={p} players={safe} size={24}/>
                   <div style={{flex:1}}>
                     <div style={{fontSize:12,fontWeight:700}}>{p}</div>
-                    <div style={{fontSize:11,color:C.textSoft}}>{stats[p]?.totalGames||0}g · {stats[p]?.topScore||0}pts</div>
+                    <div style={{fontSize:11,color:C.textSoft}}>{stats[p]?.totalGames||0}g · {stats[p]?.totalPoints||0}pts · {(stats[p]?.ppg||0).toFixed(1)} ppg</div>
                   </div>
                   {removeTarget === p ? (
                     <div style={{display:"flex",flexDirection:"column",gap:4,alignItems:"flex-end"}}>
@@ -2069,7 +2106,7 @@ insert into league_state (id,data)
                 <Av name={p} players={safe} size={32}/>
                 <div style={{flex:1}}>
                   <div style={{fontSize:14,fontWeight:700}}>{["1st","2nd","3rd"][i]} — {p}</div>
-                  <div style={{fontSize:12,color:C.textSoft}}>{stats[p]?.topScore||0} pts</div>
+                  <div style={{fontSize:12,color:C.textSoft}}>{(stats[p]?.ppg||0).toFixed(1)} ppg · {stats[p]?.totalPoints||0} pts · {stats[p]?.totalGames||0}g</div>
                 </div>
                 <div style={{fontSize:18,fontWeight:700,color:C.mintDark}}>${[payouts.first||400,payouts.second||150,payouts.third||75][i]}</div>
               </div>
@@ -2127,8 +2164,9 @@ insert into league_state (id,data)
                 {[...safe].sort((a,b)=>a.localeCompare(b)).map(p=>(
                   <div key={p} style={{background:C.white,borderRadius:10,padding:"10px 12px",border:`1.5px solid ${C.border}`}}>
                     <div style={{fontWeight:700,fontSize:13,marginBottom:4}}>{p}</div>
+                    <div style={{fontSize:12,color:C.textMid}}>PPG: {(stats[p]?.ppg||0).toFixed(1)}</div>
+                    <div style={{fontSize:12,color:C.textMid}}>Total: {stats[p]?.totalPoints||0}pts</div>
                     <div style={{fontSize:12,color:C.textMid}}>Games: {stats[p]?.totalGames||0}</div>
-                    <div style={{fontSize:12,color:C.textMid}}>Score: {stats[p]?.topScore||0}pts</div>
                     <div style={{fontSize:12,color:C.textMid}}>3P: {stats[p]?.threePersonGames||0}</div>
                     <div style={{fontSize:12,color:C.textMid}}>Sections: {stats[p]?.sectionsCount||0}</div>
                   </div>
@@ -2145,19 +2183,19 @@ insert into league_state (id,data)
 // ─── WEEKLY SUMMARY REPORT (opens in new tab, printable / saveable as PDF) ───
 function openWeeklySummary(st, stats, players) {
   const weeks   = st.weeks || [];
-  const topN    = st.seasonSettings?.topGames || 20;
-  const sorted  = [...players].sort((a,b) => (stats[b]?.topScore||0)-(stats[a]?.topScore||0));
+  const sorted  = [...players].sort((a,b) => (stats[b]?.ppg||0)-(stats[a]?.ppg||0));
   const fmtDate = d => { try{const[,m,dy]=d.split("-");return ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][+m-1]+" "+Number(dy);}catch{return d||"";} };
 
   // Build standings table rows
   const standingRows = sorted.map((p,i) => {
     const s = stats[p] || {};
     const all = [...(s.allGames||[])].sort((a,b)=>b.points-a.points);
-    const scorePills = all.map((g,gi) => `<span style="display:inline-block;background:${gi<topN?"#B8E4D8":"#FFD6E5"};color:${gi<topN?"#3D9E84":"#C45575"};border-radius:4px;padding:1px 6px;font-size:11px;margin:1px;">${g.points}pt</span>`).join(" ");
+    const scorePills = all.map((g) => `<span style="display:inline-block;background:#B8E4D8;color:#3D9E84;border-radius:4px;padding:1px 6px;font-size:11px;margin:1px;">${g.points}pt</span>`).join(" ");
     return `<tr style="background:${i%2===0?"#fff":"#FFF0F5"}">
       <td style="padding:8px 10px;font-weight:700;">${i+1}</td>
       <td style="padding:8px 10px;font-weight:700;">${p}</td>
-      <td style="padding:8px 10px;text-align:center;font-size:18px;font-weight:700;color:#C45575;">${s.topScore||0}</td>
+      <td style="padding:8px 10px;text-align:center;font-size:18px;font-weight:700;color:#C45575;">${(s.ppg||0).toFixed(1)}</td>
+      <td style="padding:8px 10px;text-align:center;font-weight:700;">${s.totalPoints||0}</td>
       <td style="padding:8px 10px;text-align:center;">${s.totalGames||0}</td>
       <td style="padding:8px 10px;text-align:center;">${s.sectionsCount||0}</td>
       <td style="padding:8px 10px;text-align:center;">${s.highestHandBonus||0}</td>
@@ -2243,12 +2281,12 @@ function openWeeklySummary(st, stats, players) {
   </div>
   <h1>🀄 Mahjong League 2026 — Season Summary</h1>
   <p style="color:#7A4A5E;font-size:13px;">Generated: ${new Date().toLocaleDateString("en-US",{weekday:"long",year:"numeric",month:"long",day:"numeric"})}</p>
-  <p style="color:#7A4A5E;font-size:13px;">Scoring: Top ${topN} individual game scores count toward season total.</p>
+  <p style="color:#7A4A5E;font-size:13px;">Scoring: ranked by average points per game (all games count). Total points and games played shown for reference.</p>
 
   <h2>📊 Season standings</h2>
   <table>
     <thead><tr style="background:#FFD6E5;">
-      <th>#</th><th>Player</th><th>Score</th><th>Games</th><th>Sections</th><th>Best hand</th><th>All scores (green = counting)</th>
+      <th>#</th><th>Player</th><th>PPG</th><th>Total</th><th>Games</th><th>Sections</th><th>Best hand</th><th>All scores</th>
     </tr></thead>
     <tbody>${standingRows}</tbody>
   </table>
