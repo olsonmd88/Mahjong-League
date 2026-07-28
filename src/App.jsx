@@ -124,7 +124,7 @@ function mkDefault() {
       recap: { draftText: "", publishedText: null, status: "none" },
     })),
     seasonSettings: { topGames: TOP_GAMES },
-    seasonPayouts: { first: 400, second: 150, third: 75 },
+    seasonPayouts: { first: 400, second: 150, third: 75, fourth: 0 },
     challengeAwardPrize: 10,
     seasonAwards: [
       {id:"concealed", label:"First concealed hand Mahjong",    prize:10, winner:null},
@@ -144,7 +144,7 @@ function validateState(raw) {
     if (!Array.isArray(raw.weeks) || raw.weeks.length === 0) return mkDefault();
     if (!Array.isArray(raw.players) || raw.players.length === 0) return mkDefault();
     if (!raw.seasonSettings || typeof raw.seasonSettings !== "object") raw.seasonSettings = {topGames:TOP_GAMES};
-    if (!raw.seasonPayouts || typeof raw.seasonPayouts !== "object") raw.seasonPayouts = {first:400, second:150, third:75};
+    if (!raw.seasonPayouts || typeof raw.seasonPayouts !== "object") raw.seasonPayouts = {first:400, second:150, third:75, fourth:0};
     if (typeof raw.challengeAwardPrize !== "number") raw.challengeAwardPrize = 10;
     if (!Array.isArray(raw.seasonAwards)) raw.seasonAwards = mkDefault().seasonAwards;
     // Ensure risk award has auto:true
@@ -680,7 +680,7 @@ function Dashboard({stats, weeks, settings, awards, players, payouts, setView, s
   const safePlayers = players || [];
   const safeWeeks   = weeks   || [];
   const safeAwards  = awards  || [];
-  const safePayouts = payouts || {first:400, second:150, third:75};
+  const safePayouts = payouts || {first:400, second:150, third:75, fourth:0};
 
   const sorted      = [...safePlayers].sort((a,b) => (stats[b]?.ppg||0) - (stats[a]?.ppg||0));
   const gamesLogged = safeWeeks.reduce((t,w) => t + (w.games?.length||0), 0);
@@ -724,7 +724,7 @@ function Dashboard({stats, weeks, settings, awards, players, payouts, setView, s
             ? <p style={{color:C.textSoft,fontSize:13,fontStyle:"italic"}}>No games played yet.</p>
             : sorted.map((p,i) => (
               <div key={p} style={{display:"flex",alignItems:"center",gap:10,padding:"7px 0",borderBottom:i<sorted.length-1?`1px dashed ${C.border}`:"none"}}>
-                <span style={{fontSize:12,color:C.textSoft,minWidth:20,fontWeight:700}}>{i===0?"🥇":i===1?"🥈":i===2?"🥉":i+1}</span>
+                <span style={{fontSize:12,color:C.textSoft,minWidth:20,fontWeight:700}}>{i===0?"🥇":i===1?"🥈":i===2?"🥉":i===3?"🎖️":i+1}</span>
                 <Av name={p} players={safePlayers}/>
                 <span style={{flex:1,fontSize:13,fontWeight:600}}>{p}</span>
                 <div style={{textAlign:"right",lineHeight:1.1}}>
@@ -808,6 +808,7 @@ function Dashboard({stats, weeks, settings, awards, players, payouts, setView, s
             <div style={{fontSize:12,color:C.text,marginTop:2}}>🥇 1st: <strong>${safePayouts.first||0}</strong></div>
             <div style={{fontSize:12,color:C.text,marginTop:2}}>🥈 2nd: <strong>${safePayouts.second||0}</strong></div>
             <div style={{fontSize:12,color:C.text,marginTop:2}}>🥉 3rd: <strong>${safePayouts.third||0}</strong></div>
+            <div style={{fontSize:12,color:C.text,marginTop:2}}>🎖️ 4th: <strong>${safePayouts.fourth||0}</strong></div>
           </div>
         </div>
       </Card>
@@ -851,7 +852,7 @@ function Standings({stats, settings, players}) {
           const pct3 = s.totalGames > 0 ? Math.round(s.threePersonGames/s.totalGames*100) : 0;
           return (
             <div key={p} style={{display:"grid",gridTemplateColumns:"24px 1fr 50px 50px 46px 44px 38px 44px",padding:"11px 16px",borderTop:`1px solid ${C.border}`,gap:6,alignItems:"center",background:i%2===0?"transparent":C.petal}}>
-              <span style={{fontSize:12,color:C.textSoft,fontWeight:700}}>{i===0?"🥇":i===1?"🥈":i===2?"🥉":i+1}</span>
+              <span style={{fontSize:12,color:C.textSoft,fontWeight:700}}>{i===0?"🥇":i===1?"🥈":i===2?"🥉":i===3?"🎖️":i+1}</span>
               <div style={{display:"flex",alignItems:"center",gap:7}}>
                 <Av name={p} players={safe} size={24}/>
                 <div>
@@ -1929,7 +1930,7 @@ function Admin({st, upd, stats, players}) {
   const [confirmRemove,setConfirmRemove] = useState(false);
   const safe   = players || [];
   const sorted = [...safe].sort((a,b) => (stats[b]?.ppg||0)-(stats[a]?.ppg||0));
-  const payouts = st.seasonPayouts || {first:400, second:150, third:75};
+  const payouts = st.seasonPayouts || {first:400, second:150, third:75, fourth:0};
 
   function addPlayer() {
     const name = newPlayer.trim();
@@ -1996,7 +1997,7 @@ insert into league_state (id,data)
             <STitle>Season-end placement payouts</STitle>
             <p style={{fontSize:13,color:C.textSoft,marginBottom:16}}>Update if the pot changes due to a player joining or leaving.</p>
             <div style={{display:"flex",flexDirection:"column",gap:10}}>
-              {[["first","🥇 1st place"],["second","🥈 2nd place"],["third","🥉 3rd place"]].map(([field,label])=>(
+              {[["first","🥇 1st place"],["second","🥈 2nd place"],["third","🥉 3rd place"],["fourth","🎖️ 4th place"]].map(([field,label])=>(
                 <div key={field} style={{display:"flex",alignItems:"center",gap:10}}>
                   <label style={{fontSize:13,fontWeight:700,color:C.textMid,minWidth:110}}>{label}</label>
                   <div style={{display:"flex",alignItems:"center",gap:4,flex:1}}>
@@ -2007,7 +2008,7 @@ insert into league_state (id,data)
               ))}
             </div>
             <div style={{background:C.mint,borderRadius:10,padding:"10px 14px",fontSize:13,color:C.mintDark,fontWeight:700,marginTop:12}}>
-              Current pot: 1st ${payouts.first||0} · 2nd ${payouts.second||0} · 3rd ${payouts.third||0}
+              Current pot: 1st ${payouts.first||0} · 2nd ${payouts.second||0} · 3rd ${payouts.third||0} · 4th ${payouts.fourth||0}
             </div>
           </Card>
           <Card>
@@ -2101,14 +2102,14 @@ insert into league_state (id,data)
           </Card>
           <Card>
             <STitle>Projected prizes</STitle>
-            {sorted.slice(0,3).map((p,i)=>(
-              <div key={p} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 0",borderBottom:i<2?`1px dashed ${C.border}`:"none"}}>
+            {sorted.slice(0,4).map((p,i)=>(
+              <div key={p} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 0",borderBottom:i<3?`1px dashed ${C.border}`:"none"}}>
                 <Av name={p} players={safe} size={32}/>
                 <div style={{flex:1}}>
-                  <div style={{fontSize:14,fontWeight:700}}>{["1st","2nd","3rd"][i]} — {p}</div>
+                  <div style={{fontSize:14,fontWeight:700}}>{["1st","2nd","3rd","4th"][i]} — {p}</div>
                   <div style={{fontSize:12,color:C.textSoft}}>{(stats[p]?.ppg||0).toFixed(1)} ppg · {stats[p]?.totalPoints||0} pts · {stats[p]?.totalGames||0}g</div>
                 </div>
-                <div style={{fontSize:18,fontWeight:700,color:C.mintDark}}>${[payouts.first||400,payouts.second||150,payouts.third||75][i]}</div>
+                <div style={{fontSize:18,fontWeight:700,color:C.mintDark}}>${[payouts.first||400,payouts.second||150,payouts.third||75,payouts.fourth||0][i]}</div>
               </div>
             ))}
           </Card>
