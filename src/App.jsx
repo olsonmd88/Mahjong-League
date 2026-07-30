@@ -159,13 +159,30 @@ function validateState(raw) {
       games: Array.isArray(w.games) ? w.games : [],
       challengeWinners: Array.isArray(w.challengeWinners) ? w.challengeWinners : [],
       challengePot: typeof w.challengePot === "number" ? w.challengePot : 5,
-      stories: w.stories && typeof w.stories === "object" ? w.stories : {},
+      stories: migrateStories(w.stories),
       recap: w.recap && typeof w.recap === "object" ? w.recap : { draftText:"", publishedText:null, status:"none" },
     }));
     return raw;
   } catch {
     return mkDefault();
   }
+}
+
+// Upgrades a week's stories object so every entry has a `media: [{url,type}]` array.
+// Older entries only had a single `noteImageUrl` string — those get folded into
+// `media` as a one-item image entry so old data keeps displaying correctly.
+function migrateStories(stories) {
+  if (!stories || typeof stories !== "object") return {};
+  const out = {};
+  Object.entries(stories).forEach(([player, s]) => {
+    if (!s || typeof s !== "object") return;
+    let media = Array.isArray(s.media) ? s.media : [];
+    if (media.length === 0 && s.noteImageUrl) {
+      media = [{ url: s.noteImageUrl, type: "image" }];
+    }
+    out[player] = { text: s.text || "", media, submittedAt: s.submittedAt || null };
+  });
+  return out;
 }
 
 // ─── STORAGE ──────────────────────────────────────────────────────────────────
@@ -213,16 +230,19 @@ async function sbSave(state) {
   } catch(e) { console.error("sbSave", e); return false; }
 }
 
-// Uploads an image file to Supabase Storage and returns its public URL, or null on failure.
-// Requires a PUBLIC bucket named STORAGE_BUCKET to exist already, with an INSERT policy
-// allowing writes (see Admin > Supabase tab notes). No x-upsert — filenames are unique
-// via timestamp, and upsert would additionally require an UPDATE policy to satisfy Postgres RLS.
-async function sbUploadImage(file, weekNum, playerName) {
+// Uploads an image OR video file to Supabase Storage and returns its public URL, or null
+// on failure. Requires a PUBLIC bucket named STORAGE_BUCKET to exist already, with an
+// INSERT policy allowing writes (see Admin > Supabase tab notes). No x-upsert — filenames
+// are unique via timestamp, and upsert would additionally require an UPDATE policy to
+// satisfy Postgres RLS. A distinct random suffix is added so multiple files uploaded in
+// the same millisecond (e.g. a multi-select batch) never collide on path.
+async function sbUploadMedia(file, weekNum, playerName) {
   if (!USE_SUPABASE || !file) return null;
   try {
     const ext  = (file.name.split(".").pop() || "jpg").toLowerCase().replace(/[^a-z0-9]/g,"") || "jpg";
     const safe = (playerName || "player").replace(/[^a-zA-Z0-9]/g,"_");
-    const path = `week${weekNum}/${safe}_${Date.now()}.${ext}`;
+    const rand = Math.random().toString(36).slice(2, 8);
+    const path = `week${weekNum}/${safe}_${Date.now()}_${rand}.${ext}`;
     const r = await fetch(`${_url}/storage/v1/object/${STORAGE_BUCKET}/${path}`, {
       method: "POST",
       headers: {
@@ -232,9 +252,33 @@ async function sbUploadImage(file, weekNum, playerName) {
       },
       body: file,
     });
-    if (!r.ok) { console.error("sbUploadImage HTTP", r.status, await r.text()); return null; }
-    return `${_url}/storage/v1/object/public/${STORAGE_BUCKET}/${path}`;
-  } catch(e) { console.error("sbUploadImage", e); return null; }
+    if (!r.ok) { console.error("sbUploadMedia HTTP", r.status, await r.text()); return null; }
+    const url = `${_url}/storage/v1/object/public/${STORAGE_BUCKET}/${path}`;
+    const type = (file.type || "").startsWith("video/") ? "video" : "image";
+    return { url, type };
+  } catch(e) { console.error("sbUploadMedia", e); return null; }
+}
+
+// Deletes a previously uploaded file from Supabase Storage, given its public URL
+// (as returned by sbUploadMedia). Used by the admin to permanently remove a
+// photo/video someone attached to their story. Returns true on success — if the
+// DELETE request fails (or Supabase isn't configured), the caller should still
+// be able to remove the item from the story's data, since a dangling file in
+// storage is harmless but a broken reference in the UI is not.
+async function sbDeleteMedia(url) {
+  if (!USE_SUPABASE || !url) return false;
+  try {
+    const marker = `/storage/v1/object/public/${STORAGE_BUCKET}/`;
+    const idx = url.indexOf(marker);
+    if (idx === -1) return false; // not a URL from our bucket — nothing to delete
+    const path = url.slice(idx + marker.length);
+    const r = await fetch(`${_url}/storage/v1/object/${STORAGE_BUCKET}/${path}`, {
+      method: "DELETE",
+      headers: {"apikey":_key, "Authorization":`Bearer ${_key}`},
+    });
+    if (!r.ok) { console.error("sbDeleteMedia HTTP", r.status, await r.text()); return false; }
+    return true;
+  } catch(e) { console.error("sbDeleteMedia", e); return false; }
 }
 
 // ─── STATS ────────────────────────────────────────────────────────────────────
@@ -628,7 +672,7 @@ export default function App() {
           {view==="weekly"     && <Weekly weeks={weeks} activeWeek={activeWeek} setAW={setAW} upd={upd} stats={stats} currentUser={st.currentUser} isAdmin={isAdmin} players={players}/>}
           {view==="log"        && <LogGame weeks={weeks} activeWeek={activeWeek} setAW={setAW} upd={upd} currentUser={st.currentUser} players={players}/>}
           {view==="challenges" && <Challenges weeks={weeks} upd={upd} isAdmin={isAdmin} currentUser={st.currentUser} players={players}/>}
-          {view==="gallery"    && <Gallery weeks={weeks} players={players}/>}
+          {view==="gallery"    && <Gallery weeks={weeks} players={players} isAdmin={isAdmin} upd={upd}/>}
           {view==="rules"      && <Rules/>}
           {view==="admin"      && isAdmin && <Admin st={st} upd={upd} stats={stats} players={players}/>}
         </main>
@@ -1080,34 +1124,52 @@ function Weekly({weeks, activeWeek, setAW, upd, stats, currentUser, isAdmin, pla
 }
 
 // ─── STORY SUBMISSION (recap material) ────────────────────────────────────────
+const MAX_STORY_MEDIA = 6;
+
 function StoryPanel({week, weekIdx, upd, currentUser, isAdmin, players}) {
   const safe    = players || [];
   const stories = week.stories || {};
   const mine    = stories[currentUser] || null;
   const [text,     setText]     = useState(mine?.text || "");
-  const [imgUrl,   setImgUrl]   = useState(mine?.noteImageUrl || null);
+  const [media,    setMedia]    = useState(mine?.media || (mine?.noteImageUrl ? [{url:mine.noteImageUrl,type:"image"}] : []));
   const [uploading,setUploading]= useState(false);
+  const [uploadMsg, setUploadMsg] = useState("");
   const [saved,    setSaved]    = useState(false);
 
-  async function handleFile(e) {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  async function handleFiles(e) {
+    const files = Array.from(e.target.files || []);
+    e.target.value = ""; // allow re-selecting the same file(s) later
+    if (!files.length) return;
+    const room = MAX_STORY_MEDIA - media.length;
+    if (room <= 0) { alert(`You can attach up to ${MAX_STORY_MEDIA} photos/videos per story.`); return; }
+    const toUpload = files.slice(0, room);
+    if (files.length > toUpload.length) alert(`Only the first ${room} file(s) were added — max ${MAX_STORY_MEDIA} per story.`);
+
     setUploading(true);
-    const url = await sbUploadImage(file, week.week, currentUser);
+    let successCount = 0;
+    for (let i = 0; i < toUpload.length; i++) {
+      setUploadMsg(`Uploading ${i+1} of ${toUpload.length}…`);
+      const result = await sbUploadMedia(toUpload[i], week.week, currentUser);
+      if (result) { setMedia(prev => [...prev, result]); successCount++; }
+    }
     setUploading(false);
-    if (url) setImgUrl(url);
-    else alert("Upload failed — check your connection and try again.");
+    setUploadMsg("");
+    if (successCount < toUpload.length) alert("Some uploads failed — check your connection and try again.");
+  }
+
+  function removeMediaAt(idx) {
+    setMedia(prev => prev.filter((_,i) => i !== idx));
   }
 
   function submit() {
-    if (!text.trim() && !imgUrl) return;
+    if (!text.trim() && media.length === 0) return;
     upd(s => ({
       ...s,
       weeks: s.weeks.map((w,i) => i===weekIdx ? {
         ...w,
         stories: { ...(w.stories||{}), [currentUser]: {
           text: text.trim().slice(0, STORY_CHAR_LIMIT),
-          noteImageUrl: imgUrl || null,
+          media,
           submittedAt: new Date().toISOString(),
         }},
       } : w),
@@ -1133,15 +1195,24 @@ function StoryPanel({week, weekIdx, upd, currentUser, isAdmin, players}) {
       />
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:6,marginBottom:12,flexWrap:"wrap",gap:8}}>
         <span style={{fontSize:11,color:C.textSoft}}>{text.length}/{STORY_CHAR_LIMIT}</span>
-        <label style={{fontSize:12,color:C.roseDark,fontWeight:700,cursor:uploading?"default":"pointer"}}>
-          {uploading ? "Uploading…" : imgUrl ? "✓ Photo attached (tap to replace)" : "📎 Attach a photo"}
-          <input type="file" accept="image/*" onChange={handleFile} style={{display:"none"}} disabled={uploading}/>
+        <label style={{fontSize:12,color:C.roseDark,fontWeight:700,cursor:(uploading||media.length>=MAX_STORY_MEDIA)?"default":"pointer"}}>
+          {uploading ? uploadMsg : media.length>0 ? `📎 Add more (${media.length}/${MAX_STORY_MEDIA})` : "📎 Attach photos or videos"}
+          <input type="file" accept="image/*,video/*" multiple onChange={handleFiles} style={{display:"none"}} disabled={uploading||media.length>=MAX_STORY_MEDIA}/>
         </label>
       </div>
-      {imgUrl && (
-        <div style={{marginBottom:12,display:"flex",alignItems:"center",gap:10}}>
-          <img src={imgUrl} alt="Your uploaded photo" style={{width:56,height:56,objectFit:"cover",borderRadius:8,border:`1.5px solid ${C.border}`}}/>
-          <button onClick={()=>setImgUrl(null)} style={{fontSize:11,color:C.roseDark,background:"transparent",border:"none",fontWeight:700}}>Remove photo</button>
+      {media.length > 0 && (
+        <div style={{marginBottom:12,display:"flex",flexWrap:"wrap",gap:10}}>
+          {media.map((m,i) => (
+            <div key={i} style={{position:"relative"}}>
+              {m.type === "video" ? (
+                <video src={m.url} style={{width:72,height:72,objectFit:"cover",borderRadius:8,border:`1.5px solid ${C.border}`}} muted/>
+              ) : (
+                <img src={m.url} alt={`Your upload ${i+1}`} style={{width:72,height:72,objectFit:"cover",borderRadius:8,border:`1.5px solid ${C.border}`}}/>
+              )}
+              {m.type === "video" && <span style={{position:"absolute",bottom:3,right:3,background:"rgba(0,0,0,.55)",color:"#fff",fontSize:9,padding:"1px 5px",borderRadius:6}}>▶ video</span>}
+              <button onClick={()=>removeMediaAt(i)} title="Remove" style={{position:"absolute",top:-6,right:-6,width:20,height:20,borderRadius:"50%",background:C.roseDark,color:"#fff",border:"2px solid #fff",fontSize:11,lineHeight:1,fontWeight:700,cursor:"pointer"}}>✕</button>
+            </div>
+          ))}
         </div>
       )}
       <div style={{display:"flex",alignItems:"center",gap:10}}>
@@ -1180,9 +1251,38 @@ function AdminStoryPreview({week, weekIdx, upd, players}) {
   const [revising,   setRevising]   = useState(false);
   const [error,      setError]      = useState(null);
   const [feedback,   setFeedback]   = useState("");
+  const [deletingKey,setDeletingKey]= useState(null); // `${player}|${index}` while a delete is in flight
 
   function saveRecap(patch) {
     upd(s => ({...s, weeks: s.weeks.map((w,i) => i===weekIdx ? {...w, recap:{...(w.recap||recap), ...patch}} : w)}));
+  }
+
+  // Removes one photo/video from a player's story. Attempts to delete the underlying
+  // file from Supabase Storage first (best-effort — requires a DELETE policy on the
+  // bucket), then always removes it from the saved story data regardless of whether
+  // the storage delete succeeded, so the UI never gets stuck showing a broken link.
+  async function deleteMediaItem(player, index) {
+    const item = (stories[player]?.media || [])[index];
+    if (!item) return;
+    if (!window.confirm(`Delete this ${item.type||"photo"} from ${player}'s story? This cannot be undone.`)) return;
+    const key = `${player}|${index}`;
+    setDeletingKey(key);
+    const storageOk = await sbDeleteMedia(item.url);
+    upd(s => ({
+      ...s,
+      weeks: s.weeks.map((w,i) => i===weekIdx ? {
+        ...w,
+        stories: {
+          ...(w.stories||{}),
+          [player]: {
+            ...(w.stories?.[player]||{}),
+            media: (w.stories?.[player]?.media||[]).filter((_,mi) => mi !== index),
+          },
+        },
+      } : w),
+    }));
+    setDeletingKey(null);
+    if (!storageOk && USE_SUPABASE) console.warn(`Removed ${player}'s media from the story, but the file may still exist in Supabase Storage (check bucket DELETE policy).`);
   }
 
   // Calls the Netlify function, which holds the Anthropic API key server-side.
@@ -1190,7 +1290,8 @@ function AdminStoryPreview({week, weekIdx, upd, players}) {
   // Netlify CLI, not a plain drag-and-drop of the dist/ folder.
   async function callGenerateRecap(mode, instruction) {
     const storiesPayload = submitted.map(p => ({
-      player: p, text: stories[p]?.text || "", noteImageUrl: stories[p]?.noteImageUrl || null,
+      player: p, text: stories[p]?.text || "",
+      noteImageUrl: (stories[p]?.media||[]).find(m=>m.type==="image")?.url || null,
     }));
     const res = await fetch("/.netlify/functions/generate-recap", {
       method: "POST",
@@ -1250,8 +1351,32 @@ function AdminStoryPreview({week, weekIdx, upd, players}) {
               <span style={{fontWeight:700,fontSize:13}}>{p}</span>
               <span style={{fontSize:10,color:C.textSoft,marginLeft:"auto"}}>{s.text?.length||0} chars</span>
             </div>
-            {s.text && <p style={{fontSize:13,color:C.text,marginBottom:s.noteImageUrl?8:0,whiteSpace:"pre-wrap"}}>{s.text}</p>}
-            {s.noteImageUrl && <img src={s.noteImageUrl} alt={`${p}'s photo`} style={{maxWidth:180,borderRadius:8,border:`1.5px solid ${C.border}`}}/>}
+            {s.text && <p style={{fontSize:13,color:C.text,marginBottom:(s.media||[]).length?8:0,whiteSpace:"pre-wrap"}}>{s.text}</p>}
+            {(s.media||[]).length > 0 && (
+              <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+                {s.media.map((m,mi) => {
+                  const key = `${p}|${mi}`;
+                  const isDeleting = deletingKey === key;
+                  return (
+                    <div key={mi} style={{position:"relative",opacity:isDeleting?0.5:1}}>
+                      {m.type === "video" ? (
+                        <video src={m.url} controls style={{maxWidth:180,maxHeight:180,borderRadius:8,border:`1.5px solid ${C.border}`}}/>
+                      ) : (
+                        <img src={m.url} alt={`${p}'s photo ${mi+1}`} style={{maxWidth:180,maxHeight:180,objectFit:"cover",borderRadius:8,border:`1.5px solid ${C.border}`}}/>
+                      )}
+                      <button
+                        onClick={()=>deleteMediaItem(p,mi)}
+                        disabled={isDeleting}
+                        title="Delete this photo/video"
+                        style={{position:"absolute",top:-8,right:-8,width:24,height:24,borderRadius:"50%",background:"#A32D2D",color:"#fff",border:"2px solid #fff",fontSize:13,lineHeight:1,fontWeight:700,cursor:isDeleting?"default":"pointer",boxShadow:"0 1px 4px rgba(0,0,0,.3)"}}
+                      >
+                        {isDeleting ? "…" : "✕"}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         );
       })}
@@ -1306,39 +1431,83 @@ function PublishedRecap({week}) {
 // If you'd rather gate a week's photos until that week's recap goes out (same
 // reveal treatment as the story text), add `&& w.recap?.status === "published"`
 // to the filter condition below.
-function Gallery({weeks, players}) {
+function Gallery({weeks, players, isAdmin, upd}) {
   const safe = players || [];
+  const [deletingKey, setDeletingKey] = useState(null); // `${weekIdx}|${player}|${index}`
   const photos = [];
-  (weeks || []).forEach(w => {
+  (weeks || []).forEach((w, weekIdx) => {
     const stories = w.stories || {};
     Object.entries(stories).forEach(([player, s]) => {
-      if (s?.noteImageUrl) {
-        photos.push({ player, week: w.week, date: w.date, url: s.noteImageUrl, submittedAt: s.submittedAt });
-      }
+      (s?.media||[]).forEach((m, mediaIdx) => {
+        photos.push({ weekIdx, player, mediaIdx, week: w.week, date: w.date, url: m.url, type: m.type||"image", submittedAt: s.submittedAt });
+      });
     });
   });
   photos.sort((a,b) => new Date(b.submittedAt||0) - new Date(a.submittedAt||0));
 
+  // Admin-only: permanently removes a photo/video from the gallery (and the
+  // player's underlying story). Best-effort deletes the file from Supabase
+  // Storage too — requires a DELETE policy on the bucket to fully succeed.
+  async function deletePhoto(item) {
+    if (!window.confirm(`Delete this ${item.type} from ${item.player}'s week ${item.week} story? This cannot be undone.`)) return;
+    const key = `${item.weekIdx}|${item.player}|${item.mediaIdx}`;
+    setDeletingKey(key);
+    const storageOk = await sbDeleteMedia(item.url);
+    upd(s => ({
+      ...s,
+      weeks: s.weeks.map((w,i) => i===item.weekIdx ? {
+        ...w,
+        stories: {
+          ...(w.stories||{}),
+          [item.player]: {
+            ...(w.stories?.[item.player]||{}),
+            media: (w.stories?.[item.player]?.media||[]).filter((_,mi) => mi !== item.mediaIdx),
+          },
+        },
+      } : w),
+    }));
+    setDeletingKey(null);
+    if (!storageOk && USE_SUPABASE) console.warn(`Removed ${item.player}'s media from the gallery, but the file may still exist in Supabase Storage (check bucket DELETE policy).`);
+  }
+
   return (
     <div className="fa">
       <h2 style={{fontFamily:"Playfair Display,serif",fontSize:22,color:C.roseDark,fontStyle:"italic",marginBottom:4}}>Season photos 📷</h2>
-      <p style={{color:C.textSoft,fontSize:13,marginBottom:20}}>Every photo shared with a weekly story, all in one place.</p>
+      <p style={{color:C.textSoft,fontSize:13,marginBottom:20}}>Every photo and video shared with a weekly story, all in one place.</p>
       {photos.length === 0 ? (
-        <Card><p style={{fontSize:13,color:C.textSoft,fontStyle:"italic"}}>No photos uploaded yet — they'll show up here as people attach them to their weekly stories.</p></Card>
+        <Card><p style={{fontSize:13,color:C.textSoft,fontStyle:"italic"}}>Nothing uploaded yet — photos and videos will show up here as people attach them to their weekly stories.</p></Card>
       ) : (
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(160px,1fr))",gap:14}}>
-          {photos.map((p,i) => (
-            <Card key={i} pad="0" style={{overflow:"hidden"}}>
-              <img src={p.url} alt={`${p.player}'s photo from week ${p.week}`} style={{width:"100%",height:140,objectFit:"cover",display:"block"}}/>
-              <div style={{padding:"8px 10px",display:"flex",alignItems:"center",gap:6}}>
-                <Av name={p.player} players={safe} size={18}/>
-                <div style={{minWidth:0}}>
-                  <div style={{fontSize:12,fontWeight:700,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.player}</div>
-                  <div style={{fontSize:10,color:C.textSoft}}>Week {p.week}{p.date?` · ${fmt(p.date)}`:""}</div>
+          {photos.map((p,i) => {
+            const key = `${p.weekIdx}|${p.player}|${p.mediaIdx}`;
+            const isDeleting = deletingKey === key;
+            return (
+              <Card key={i} pad="0" style={{overflow:"hidden",position:"relative",opacity:isDeleting?0.5:1}}>
+                {isAdmin && (
+                  <button
+                    onClick={()=>deletePhoto(p)}
+                    disabled={isDeleting}
+                    title="Delete this photo/video"
+                    style={{position:"absolute",top:6,right:6,zIndex:2,width:24,height:24,borderRadius:"50%",background:"#A32D2D",color:"#fff",border:"2px solid #fff",fontSize:13,lineHeight:1,fontWeight:700,cursor:isDeleting?"default":"pointer",boxShadow:"0 1px 4px rgba(0,0,0,.4)"}}
+                  >
+                    {isDeleting ? "…" : "✕"}
+                  </button>
+                )}
+                {p.type === "video" ? (
+                  <video src={p.url} controls style={{width:"100%",height:140,objectFit:"cover",display:"block",background:"#000"}}/>
+                ) : (
+                  <img src={p.url} alt={`${p.player}'s photo from week ${p.week}`} style={{width:"100%",height:140,objectFit:"cover",display:"block"}}/>
+                )}
+                <div style={{padding:"8px 10px",display:"flex",alignItems:"center",gap:6}}>
+                  <Av name={p.player} players={safe} size={18}/>
+                  <div style={{minWidth:0}}>
+                    <div style={{fontSize:12,fontWeight:700,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.player}{p.type==="video"?" 🎬":""}</div>
+                    <div style={{fontSize:10,color:C.textSoft}}>Week {p.week}{p.date?` · ${fmt(p.date)}`:""}</div>
+                  </div>
                 </div>
-              </div>
-            </Card>
-          ))}
+              </Card>
+            );
+          })}
         </div>
       )}
     </div>
