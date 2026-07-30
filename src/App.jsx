@@ -1381,18 +1381,20 @@ function AdminStoryPreview({week, weekIdx, upd, players}) {
         );
       })}
 
-      {recap.status === "none" && (
-        <button onClick={handleGenerate} disabled={generating || submitted.length===0} style={{marginTop:8,background:`linear-gradient(90deg,${C.roseDark},${C.lavDark})`,color:"#fff",border:"none",borderRadius:10,padding:"10px 20px",fontSize:13,fontWeight:700,opacity:generating?0.6:1}}>
-          {generating ? "Generating…" : "Generate recap ✦"}
-        </button>
-      )}
-
-      {recap.status !== "none" && (
+      {submitted.length > 0 && (
         <div style={{marginTop:14,paddingTop:14,borderTop:`1.5px solid ${C.lavDark}`}}>
           <div style={{fontSize:11,fontWeight:700,color:C.lavDark,textTransform:"uppercase",letterSpacing:".5px",marginBottom:8}}>
             Draft recap {recap.status==="published" ? "· published ✓" : ""}
           </div>
-          <textarea value={recap.draftText} onChange={e=>saveRecap({draftText:e.target.value})} style={{minHeight:220,resize:"vertical",fontFamily:"Nunito,sans-serif"}}/>
+
+          {/* Generate is always offered here — if it's down, the box below still
+              works for a fully manual/pasted-in recap, so publishing never has
+              to wait on the AI function. */}
+          <button onClick={handleGenerate} disabled={generating} style={{marginBottom:10,background:`linear-gradient(90deg,${C.roseDark},${C.lavDark})`,color:"#fff",border:"none",borderRadius:10,padding:"10px 20px",fontSize:13,fontWeight:700,opacity:generating?0.6:1}}>
+            {generating ? "Generating…" : recap.status==="none" ? "Generate recap ✦" : "Regenerate recap ✦"}
+          </button>
+
+          <textarea value={recap.draftText} onChange={e=>saveRecap({draftText:e.target.value, status: recap.status==="none" ? "draft" : recap.status})} placeholder="Paste or write the recap here…" style={{minHeight:220,resize:"vertical",fontFamily:"Nunito,sans-serif"}}/>
 
           <div style={{display:"flex",gap:8,marginTop:10,flexWrap:"wrap",alignItems:"center"}}>
             <input value={feedback} onChange={e=>setFeedback(e.target.value)} placeholder="e.g. make the Charlie bit harsher…" style={{flex:1,minWidth:180}}/>
@@ -1400,9 +1402,9 @@ function AdminStoryPreview({week, weekIdx, upd, players}) {
               {revising ? "Revising…" : (recap.editsUsed||0)>=1 ? "Free edit used" : "Ask AI to revise (1 free)"}
             </button>
           </div>
-          <div style={{fontSize:11,color:C.lavDark,marginTop:4,fontStyle:"italic"}}>You can also just type directly in the box above — manual edits are always free.</div>
+          <div style={{fontSize:11,color:C.lavDark,marginTop:4,fontStyle:"italic"}}>You can also just type or paste directly in the box above — manual edits are always free.</div>
 
-          <button onClick={handlePublish} style={{marginTop:10,background:`linear-gradient(90deg,${C.roseDark},${C.lavDark})`,color:"#fff",border:"none",borderRadius:10,padding:"9px 20px",fontSize:13,fontWeight:700}}>
+          <button onClick={handlePublish} disabled={!recap.draftText?.trim()} style={{marginTop:10,background:`linear-gradient(90deg,${C.roseDark},${C.lavDark})`,color:"#fff",border:"none",borderRadius:10,padding:"9px 20px",fontSize:13,fontWeight:700,opacity:recap.draftText?.trim()?1:0.5}}>
             {recap.status==="published" ? "Re-publish (overwrite)" : "Publish to group ✓"}
           </button>
         </div>
